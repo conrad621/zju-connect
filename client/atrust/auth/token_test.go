@@ -1,7 +1,6 @@
 package auth
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +21,22 @@ func TestAuthStepFromTokenService(t *testing.T) {
 		t.Fatalf("unexpected token step: %+v", step)
 	}
 
+	// bilibili-style gateways describe the second factor as
+	// authType=auth/token with subType=https and authName=TOTP, which aTrust
+	// routes to the custom-token flow (field "code").
+	step = authStepFromData(authStepData{
+		NextService: "auth/token",
+		NextServiceList: []authServiceInfo{{
+			AuthID:   "totp-id",
+			AuthType: "auth/token",
+			SubType:  "https",
+			AuthName: "TOTP",
+		}},
+	})
+	if step.Service != "auth/customToken" || step.AuthID != "totp-id" {
+		t.Fatalf("unexpected https token step: %+v", step)
+	}
+
 	step = authStepFromData(authStepData{NextService: "auth/sendSms"})
 	if step.Service != "auth/sms" || step.SMSMode != smsWithoutAuthID {
 		t.Fatalf("unexpected sendSms step: %+v", step)
@@ -29,24 +44,18 @@ func TestAuthStepFromTokenService(t *testing.T) {
 }
 
 func TestSubmitTOTPToken(t *testing.T) {
-	type requestPayload struct {
-		Username          string `json:"username"`
-		Action            string `json:"action"`
-		TOTPToken         string `json:"totpToken"`
-		IsPrevEffect      bool   `json:"isPrevEffect"`
-		SkipSecondaryAuth int    `json:"skipSecondaryAuth"`
-	}
-
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/passport/v1/auth/token" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 		}
-		var payload requestPayload
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if r.URL.Query().Get("authId") != "" {
+			t.Errorf("authId must be sent in the body, not the URL: %s", r.URL.RawQuery)
+		}
+		if err := r.ParseForm(); err != nil {
 			t.Error(err)
 		}
-		if payload.Username != "user@domain" || payload.Action != "auth" || payload.TOTPToken != "123456" || payload.IsPrevEffect || payload.SkipSecondaryAuth != 0 {
-			t.Errorf("unexpected payload: %+v", payload)
+		if r.Form.Get("username") != "user@domain" || r.Form.Get("action") != "auth" || r.Form.Get("totpToken") != "123456" || r.Form.Get("isPrevEffect") != "false" || r.Form.Get("authId") != "totp-id" || r.Form.Get("skipSecondaryAuth") != "0" {
+			t.Errorf("unexpected payload: %+v", r.Form)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"code":0,"data":{"nextService":"auth/accessCheck"}}`)
@@ -55,7 +64,7 @@ func TestSubmitTOTPToken(t *testing.T) {
 
 	session := newTLSTestSession(server)
 	session.username = "user@domain"
-	step, err := session.submitToken(map[string]interface{}{
+	step, err := session.submitToken("totp-id", map[string]interface{}{
 		"username":          session.username,
 		"action":            "auth",
 		"totpToken":         "123456",
@@ -72,15 +81,11 @@ func TestSubmitTOTPToken(t *testing.T) {
 
 func TestCompleteTOTPUsesStructuredChallengeResponse(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload struct {
-			Token             string `json:"totpToken"`
-			SkipSecondaryAuth int    `json:"skipSecondaryAuth"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := r.ParseForm(); err != nil {
 			t.Error(err)
 		}
-		if payload.Token != "123456" || payload.SkipSecondaryAuth != 1 {
-			t.Errorf("unexpected payload: %+v", payload)
+		if r.Form.Get("totpToken") != "123456" || r.Form.Get("skipSecondaryAuth") != "1" {
+			t.Errorf("unexpected payload: %+v", r.Form)
 		}
 		fmt.Fprint(w, `{"code":0,"data":{}}`)
 	}))
@@ -95,19 +100,50 @@ func TestCompleteTOTPUsesStructuredChallengeResponse(t *testing.T) {
 			return authchallenge.CodeResponse{Code: "123456", SkipSecondaryAuth: true}, nil
 		},
 	}
-	if _, err := session.completeTOTP(); err != nil {
+	if _, err := session.completeTOTP(authStep{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCompleteCustomTokenUsesCodeField(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/passport/v1/auth/token" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if err := r.ParseForm(); err != nil {
+			t.Error(err)
+		}
+		if r.Form.Get("code") != "123456" || r.Form.Get("skipSecondaryAuth") != "1" || r.Form.Get("authId") != "token-id" {
+			t.Errorf("unexpected payload: %+v", r.Form)
+		}
+		if r.Form.Get("totpToken") != "" || r.Form.Get("action") != "" || r.Form.Get("isPrevEffect") != "" {
+			t.Errorf("unexpected TOTP fields in custom token payload: %+v", r.Form)
+		}
+		fmt.Fprint(w, `{"code":0,"data":{}}`)
+	}))
+	defer server.Close()
+
+	session := newTLSTestSession(server)
+	session.challengeHandler = authchallenge.HandlerFuncs{
+		Code: func(challenge authchallenge.CodeChallenge) (authchallenge.CodeResponse, error) {
+			if challenge.Kind != authchallenge.CodeTOTP || !challenge.CanSkipSecondaryAuth {
+				t.Fatalf("unexpected challenge: %+v", challenge)
+			}
+			return authchallenge.CodeResponse{Code: "123456", SkipSecondaryAuth: true}, nil
+		},
+	}
+	if _, err := session.completeCustomToken(authStep{AuthID: "token-id"}); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func TestSubmitTokenAllowsSessionBoundIdentity(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := r.ParseForm(); err != nil {
 			t.Error(err)
 		}
-		if _, found := payload["username"]; found {
-			t.Errorf("session-bound token request unexpectedly included username: %+v", payload)
+		if r.Form.Get("username") != "" {
+			t.Errorf("session-bound token request unexpectedly included username: %+v", r.Form)
 		}
 		fmt.Fprint(w, `{"code":0,"data":{}}`)
 	}))
@@ -116,7 +152,7 @@ func TestSubmitTokenAllowsSessionBoundIdentity(t *testing.T) {
 	session := newTLSTestSession(server)
 	payload := map[string]interface{}{"totpToken": "123456"}
 	session.addUsername(payload)
-	if _, err := session.submitToken(payload); err != nil {
+	if _, err := session.submitToken("", payload); err != nil {
 		t.Fatal(err)
 	}
 }

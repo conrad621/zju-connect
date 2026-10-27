@@ -2,10 +2,14 @@ package auth
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/mythologyli/zju-connect/client/authchallenge"
@@ -19,7 +23,7 @@ type tokenResponse struct {
 	Data    authStepData `json:"data"`
 }
 
-func (s *Session) completeTOTP() (authStep, error) {
+func (s *Session) completeTOTP(step authStep) (authStep, error) {
 	response := authchallenge.CodeResponse{}
 	if s.totpSecret != "" {
 		var err error
@@ -40,17 +44,44 @@ func (s *Session) completeTOTP() (authStep, error) {
 		}
 	}
 
+	skipSecondaryAuth := "0"
+	if response.SkipSecondaryAuth {
+		skipSecondaryAuth = "1"
+	}
 	payload := map[string]interface{}{
 		"action":            "auth",
+		"taskId":            newTaskID(),
 		"totpToken":         response.Code,
 		"isPrevEffect":      false,
-		"skipSecondaryAuth": boolToInt(response.SkipSecondaryAuth),
+		"skipSecondaryAuth": skipSecondaryAuth,
 	}
-	s.addUsername(payload)
-	return s.submitToken(payload)
+	return s.submitToken(step.AuthID, payload)
 }
 
-func (s *Session) completeRadius(service string) (authStep, error) {
+func (s *Session) completeCustomToken(step authStep) (authStep, error) {
+	challenge := authchallenge.CodeChallenge{
+		Kind:                 authchallenge.CodeTOTP,
+		Message:              "Please enter the TOTP token:",
+		CanSkipSecondaryAuth: true,
+	}
+	response, err := s.challengeHandler.HandleCodeChallenge(challenge)
+	if err != nil {
+		return authStep{}, fmt.Errorf("complete custom token challenge: %w", err)
+	}
+
+	skipSecondaryAuth := "0"
+	if response.SkipSecondaryAuth {
+		skipSecondaryAuth = "1"
+	}
+	payload := map[string]interface{}{
+		"code":              response.Code,
+		"skipSecondaryAuth": skipSecondaryAuth,
+		"taskId":            newTaskID(),
+	}
+	return s.submitToken(step.AuthID, payload)
+}
+
+func (s *Session) completeRadius(service string, step authStep) (authStep, error) {
 	challenge := authchallenge.CodeChallenge{
 		Kind:                 authchallenge.CodeRadius,
 		Message:              "Please enter the RADIUS token:",
@@ -75,7 +106,7 @@ func (s *Session) completeRadius(service string) (authStep, error) {
 		payload["skipSecondaryAuth"] = boolToInt(response.SkipSecondaryAuth)
 	}
 	s.addUsername(payload)
-	return s.submitTokenAt(service, payload)
+	return s.submitTokenAt(service, step.AuthID, payload)
 }
 
 func (s *Session) addUsername(payload map[string]interface{}) {
@@ -91,19 +122,49 @@ func boolToInt(value bool) int {
 	return 0
 }
 
-func (s *Session) submitToken(payload map[string]interface{}) (authStep, error) {
-	return s.submitTokenAt("auth/token", payload)
+func formEncode(payload map[string]interface{}) []byte {
+	form := url.Values{}
+	for key, value := range payload {
+		var s string
+		switch v := value.(type) {
+		case string:
+			s = v
+		case bool:
+			s = strconv.FormatBool(v)
+		default:
+			s = fmt.Sprintf("%v", v)
+		}
+		if s != "" {
+			form.Set(key, s)
+		}
+	}
+	return []byte(form.Encode())
 }
 
-func (s *Session) submitTokenAt(service string, payload map[string]interface{}) (authStep, error) {
+func newTaskID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant 10
+	return hex.EncodeToString(b)
+}
+
+func (s *Session) submitToken(authID string, payload map[string]interface{}) (authStep, error) {
+	return s.submitTokenAt("auth/token", authID, payload)
+}
+
+func (s *Session) submitTokenAt(service string, authID string, payload map[string]interface{}) (authStep, error) {
 	if service != "auth/token" && service != "auth/challenge" {
 		return authStep{}, fmt.Errorf("unsupported token authentication service: %s", service)
 	}
 
-	postBody, err := json.Marshal(payload)
-	if err != nil {
-		return authStep{}, err
+	if authID != "" {
+		payload["authId"] = authID
 	}
+
+	postBody := formEncode(payload)
 
 	path := "/passport/v1/" + service
 	log.Printf("Perform POST %s", path)
@@ -113,9 +174,8 @@ func (s *Session) submitTokenAt(service string, payload map[string]interface{}) 
 		return authStep{}, err
 	}
 	req.Header.Set("User-Agent", UserAgent)
-	req.Header.Set("Content-Type", "application/json;charset=utf-8")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("x-csrf-token", s.csrfToken)
-	req.Header.Set("x-sdp-env", s.env)
 	req.Header.Set("x-sdp-traceid", s.randSdpId())
 
 	resp, err := s.request(req)

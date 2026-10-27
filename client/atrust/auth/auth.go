@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"runtime"
 	"strings"
 	"time"
 
@@ -27,8 +28,19 @@ const (
 
 var sharedParams = url.Values{
 	"clientType": {"SDPClient"},
-	"platform":   {"Linux"},
+	"platform":   {platformType()},
 	"lang":       {"en-US"},
+}
+
+func platformType() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Mac"
+	case "windows":
+		return "Windows"
+	default:
+		return "Linux"
+	}
 }
 
 func WithSharedParams(extra url.Values) url.Values {
@@ -257,11 +269,13 @@ func (s *Session) continueAuth(step authStep) error {
 		case "auth/customSms":
 			step, err = s.completeCustomSMS()
 		case "auth/totp":
-			step, err = s.completeTOTP()
+			step, err = s.completeTOTP(step)
+		case "auth/customToken":
+			step, err = s.completeCustomToken(step)
 		case "auth/radius":
-			step, err = s.completeRadius("auth/token")
+			step, err = s.completeRadius("auth/token", step)
 		case "auth/challenge":
-			step, err = s.completeRadius("auth/challenge")
+			step, err = s.completeRadius("auth/challenge", step)
 		case "auth/accessCheck":
 			step, err = s.accessCheck()
 		case "auth/preEnhancedAuth", "auth/enhancedConfirm", "auth/enhancedDone":

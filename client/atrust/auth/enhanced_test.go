@@ -19,7 +19,7 @@ func TestRadiusChallengeEndpoint(t *testing.T) {
 
 	session := newTLSTestSession(server)
 	session.username = "user"
-	step, err := session.submitTokenAt("auth/challenge", map[string]interface{}{
+	step, err := session.submitTokenAt("auth/challenge", "", map[string]interface{}{
 		"username": "user", "radiusToken": "123456", "skipSecondaryAuth": 0,
 	})
 	if err != nil {

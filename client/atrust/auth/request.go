@@ -309,6 +309,7 @@ type authServiceInfo struct {
 	AuthID   string `json:"authId"`
 	AuthType string `json:"authType"`
 	SubType  string `json:"subType"`
+	AuthName string `json:"authName"`
 }
 
 type authStepData struct {
@@ -347,8 +348,13 @@ func authStepFromData(data authStepData) authStep {
 			case "auth/totp", "auth/radius", "auth/challenge":
 				step.Service = selected.AuthType
 			case "auth/token":
-				if selected.SubType == "totp" {
+				switch selected.SubType {
+				case "totp":
 					step.Service = "auth/totp"
+				case "https":
+					// aTrust routes subType "https" to the custom-token auth page,
+					// whose payload uses the "code" field (not "totpToken").
+					step.Service = "auth/customToken"
 				}
 			}
 		}
